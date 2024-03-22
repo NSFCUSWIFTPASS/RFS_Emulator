@@ -14,11 +14,15 @@ from configparser import ConfigParser
 import psycopg2
 import argparse
 from gen import GaussianDataGenerator
+from datetime import datetime, timezone, timedelta
+import requests
+import base64
 
 class Database:
-    def __init__(self, config_filename='db_config.ini', config_section='postgresql'):
+    def __init__(self, direct=True, config_filename='db_config.ini', config_section='postgresql'):
         self.connection = None
-        self.connect(config_filename, config_section)
+        if(not direct):
+            self.connect(config_filename, config_section)
 
     def connect(self, filename, section):
         parser = ConfigParser()
@@ -50,7 +54,7 @@ class Database:
             print("Database connection closed.")
 
 class StatsGenerator:
-    def __init__(self, noise, generator, hardware_id, metadata_id, db, noise_duration, rfi_duration, rfi_shift):
+    def __init__(self, noise, generator, hardware_id, metadata_id, db, noise_duration, rfi_duration, rfi_shift, direct=False, api_token=None, dst_http=None, monitor_id=None):
         self.generator = generator
         self.hardware_id = hardware_id
         self.metadata_id = metadata_id
@@ -59,8 +63,75 @@ class StatsGenerator:
         self.noise_duration = noise_duration
         self.rfi_duration = rfi_duration
         self.rfi_shift = rfi_shift
+        self.direct = direct
+        self.api_token = api_token
+        self.dst_http = dst_http
+        self.monitor_id = monitor_id
         self.data_history = []  # Initialize an empty list to store data history
         self.should_stop = False
+
+    def encode_data(self, data):
+        return base64.b64encode(data.encode()).decode('utf-8')
+
+    def format_data_as_csv(self, created_at, average_db, max_db, median_db, std_dev, kurtosis):
+        """
+        Format the generated data into a CSV string.
+
+        Returns:
+            str: A CSV-formatted string of data.
+        """
+        
+        frequency = 915000000
+        power = average_db
+        center_freq = frequency
+        bandwidth = 1000000
+        gain = 35
+        length = 1.0
+        interval = 10
+        if(kurtosis > 4):
+            violation = 1
+        else:
+            violation = 0
+        
+        abovefloor = - 60 - average_db
+
+        # Format the CSV string
+        csv_data = (f"frequency,power,center_freq,max_db,median_db,std_dev,kurtosis,"
+                    f"bandwidth,gain,length,interval,created_at,violation,abovefloor\n"
+                    f"{frequency},{power:.3f},{center_freq},{max_db:.3f},{median_db:.3f},{std_dev:.3f},"
+                    f"{kurtosis:.3f},{bandwidth},{gain},{length},{interval},"
+                    f"{created_at},{violation},{abovefloor}\n")
+        
+        print(csv_data)
+        return csv_data
+
+    def send_data(self, encoded_data):
+        now = datetime.utcnow()
+        starts_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        ends_at = (now + timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        headers = {
+            "X-Api-Token": self.api_token,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "monitor_id": self.monitor_id,
+            "types": "inline,sweep",
+            "format": "rfs-csv-inline",
+            "starts_at": starts_at,
+            "ends_at": ends_at,
+            "description": "inline violation",
+            "data": encoded_data,
+        }
+        try:
+            response = requests.post(f"{self.dst_http}/observations", json=payload, headers=headers)
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed: {e}")
+            return None
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            return None
 
     def write_data_periodically(self, interval):
         start_time = time.time()
@@ -98,14 +169,18 @@ class StatsGenerator:
             fake_kurtosis = ((np.mean(data) - self.noise) + 2) * 0.6  # Fake kurtosis calculation
             fake_kurtosis = 0 if fake_kurtosis < 0 else fake_kurtosis  # Ensure kurtosis is not negative
             kurtosis = fake_kurtosis
-            created_at = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
+            created_at = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + '+00:00'
 
-            print(f"Inserting: Hardware ID: {self.hardware_id}, Metadata ID: {self.metadata_id}, "
-                  f"Created At: {created_at}, Average DB: {average_db:.2f}, Max DB: {max_db:.2f}, "
-                  f"Median DB: {median_db:.2f}, Std Dev: {std_dev:.4f}, Kurtosis: {kurtosis:.2f}")
+            if self.direct:
+                csv_data = self.format_data_as_csv(created_at, average_db, max_db, median_db, std_dev, kurtosis)
+                encoded_data = self.encode_data(csv_data)
+                self.send_data(encoded_data)
+            else:
+                print(f"Inserting: Hardware ID: {self.hardware_id}, Metadata ID: {self.metadata_id}, "
+                    f"Created At: {created_at}, Average DB: {average_db:.2f}, Max DB: {max_db:.2f}, "
+                    f"Median DB: {median_db:.2f}, Std Dev: {std_dev:.4f}, Kurtosis: {kurtosis:.2f}")
 
-            self.db.insert_data(self.hardware_id, self.metadata_id, created_at, average_db, max_db, median_db, std_dev, kurtosis)
-
+                self.db.insert_data(self.hardware_id, self.metadata_id, created_at, average_db, max_db, median_db, std_dev, kurtosis)
             time.sleep(interval)
 
     def stop(self):
@@ -120,11 +195,16 @@ if __name__ == "__main__":
     parser.add_argument('--rfi_duration', type=int, required=True, help='Duration (seconds) for RFI data generation')
     parser.add_argument('--rfi_shift', type=float, required=True, help='Value to shift the anchor by during RFI generation')
     parser.add_argument('--write_interval', type=float, required=True, help='Interval (seconds) between data writes to the database')
+    parser.add_argument('--direct', action='store_true', help='Send data directly to OpenZMS if specified')
+    parser.add_argument('--api_token', type=str, help='API Token for OpenZMS')
+    parser.add_argument('--dst_http', type=str, help='Destination HTTP path for OpenZMS')
+    parser.add_argument('--monitor_id', type=str, help='Monitor ID for OpenZMS')
     args = parser.parse_args()
-    db = Database()
+    db = Database(direct=args.direct)
     generator = GaussianDataGenerator(anchor=args.noise_floor, std_dev=2)
     stats_generator = StatsGenerator(args.noise_floor, generator, args.hardware_id, args.metadata_id, db,
-                                     args.noise_duration, args.rfi_duration, args.rfi_shift)
+                                     args.noise_duration, args.rfi_duration, args.rfi_shift,
+                                     direct=args.direct, api_token=args.api_token, dst_http=args.dst_http, monitor_id=args.monitor_id)
     try:
         stats_generator.write_data_periodically(args.write_interval)  # Use the provided interval for data writes
     except KeyboardInterrupt:

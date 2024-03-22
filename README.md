@@ -28,6 +28,11 @@ python3 rf_stats_gen.py --noise_floor 100 --hardware_id 1 --metadata_id 1 --nois
 - `--rfi_shift`: Amount in dBm by which stats move up
 - `--write_interval`: Interval between two stats generations
 
+To directly send data to OpenZMS use --direct and provide the necessary parameters like so:
+
+```bash
+python3 rf_stats_gen.py --noise_floor -115 --hardware_id 1 --metadata_id 20 --noise_duration 25 --rfi_duration 12 --rfi_shift 20 --write_interval 5 --direct --monitor_id bf9d9806-fae9-4361-a2b6-52cc1dd3dd46 --api_token <TOKEN>  --dst_http http://localhost:8020/v1
+```
 
 Use start_sensor.py to start multiple instances of rf_stats_gen.py based on the number of metadata IDs required. Each metadata ID is put in an array inside start_sensor.py
 
